@@ -3,7 +3,15 @@ const $ = selector => document.querySelector(selector);
 let db, entries = [], page = 0, selected = 0, editing = null, deleted = null, pendingBackup = null, busy = false;
 const MAX_IMAGE = 20 * 1024 * 1024;
 const urls = new Map();
-function notify(message, undo = false) { $('#status span').textContent = message; $('#undo').hidden = !undo; $('#status').hidden = false; }
+let noticeTimer;
+function hideNotice() { clearTimeout(noticeTimer); $('#status').hidden = true; }
+function notify(message, undo = false) {
+  clearTimeout(noticeTimer);
+  $('#status span').textContent = message;
+  $('#undo').hidden = !undo;
+  $('#status').hidden = false;
+  noticeTimer = setTimeout(hideNotice, undo ? 6000 : 3000);
+}
 function fail(error) { console.error(error); notify(error.name === 'QuotaExceededError' ? '저장 공간이 부족함 · 먼저 백업한 뒤 공간을 확보해 주세요' : '작업하지 못했음 · ' + error.message); }
 function today() { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; }
 function updateMonth() { const date = today(); $('#month-title').textContent = Number(date.slice(5,7))+'월의 조각들'; $('#month-label').textContent = date.slice(0,7).replace('-', '. '); $('.issue').textContent = $('#month-label').textContent; }
@@ -23,7 +31,7 @@ $('#add').onclick=()=>compose(); $('#cancel').onclick=()=>$('#composer').close()
 $('#composer form').onsubmit=async event=>{ event.preventDefault(); if(busy)return; busy=true; $('#save').disabled=true; try { const date=$('#new-date').value; if(!validDate(date))throw new Error('올바른 날짜를 입력해 주세요'); const image=editing?.image || $('#upload').files[0]; if(!image)throw new Error('사진을 선택해 주세요'); if(!editing)await checkImage(image); const entry={id:editing?.id || crypto.randomUUID(),createdAt:editing?.createdAt || new Date().toISOString(),date,text:$('#new-message').value,image}; await transaction('readwrite',s=>s.put(entry)); page=0; await refresh(); $('#composer').close(); notify('기록을 저장함'); }catch(e){$('#form-error').textContent=e.name==='QuotaExceededError'?'저장 공간이 부족함 · 백업 후 공간을 확보해 주세요':e.message;}finally{busy=false;$('#save').disabled=false;} };
 $('#date').onchange=()=>run(async()=>{const original=entries[selected];const date=$('#date').value;if(!validDate(date)){$('#date').value=original.date;throw new Error('올바른 날짜를 입력해 주세요');}try{await transaction('readwrite',s=>s.put({...original,date}));await refresh();openEntry(entries.findIndex(e=>e.id===original.id));}catch(e){$('#date').value=original.date;throw e;}});
 $('#delete-entry').onclick=()=>run(async()=>{ const entry=entries[selected]; await transaction('readwrite',s=>s.delete(entry.id)); deleted=entry; $('#viewer').close(); await refresh(); notify('기록을 삭제함',true); });
-$('#undo').onclick=()=>run(async()=>{if(!deleted)return;await transaction('readwrite',s=>s.put(deleted));deleted=null;await refresh();notify('삭제한 기록을 복원함');}); $('#dismiss').onclick=()=>$('#status').hidden=true;
+$('#undo').onclick=()=>run(async()=>{if(!deleted)return;await transaction('readwrite',s=>s.put(deleted));deleted=null;await refresh();notify('삭제한 기록을 복원함');}); $('#dismiss').onclick=hideNotice;
 $('#prev').onclick=()=>{page--;render();};$('#next').onclick=()=>{page++;render();};$('#back').onclick=()=>move(-1);$('#forward').onclick=()=>move(1);
 document.addEventListener('keydown',e=>{if($('#viewer').open && !['INPUT','TEXTAREA','BUTTON'].includes(e.target.tagName)){if(e.key==='ArrowRight')move(1);if(e.key==='ArrowLeft')move(-1);}});
 let touch; $('#large').addEventListener('touchstart',e=>{touch=[e.changedTouches[0].clientX,e.changedTouches[0].clientY];},{passive:true});$('#large').addEventListener('touchend',e=>{if(!touch)return;const dx=e.changedTouches[0].clientX-touch[0],dy=e.changedTouches[0].clientY-touch[1];if(Math.abs(dx)>45&&Math.abs(dx)>Math.abs(dy))move(dx<0?1:-1);touch=null;},{passive:true});
@@ -35,3 +43,8 @@ $('#restore-cancel').onclick=()=>{pendingBackup=null;$('#restore').close();};
 $('#restore-confirm').onclick=()=>run(async()=>{if(!pendingBackup)return;const records=pendingBackup;await new Promise((resolve,reject)=>{const tx=db.transaction('records','readwrite'),store=tx.objectStore('records');for(const e of records){const req=store.get(e.id);req.onsuccess=()=>{if(!req.result)store.add(e);};}tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('가져오기가 취소됨'));});pendingBackup=null;$('#restore').close();page=0;await refresh();notify('백업 가져오기 완료');});
 updateMonth();setInterval(updateMonth,60000);document.addEventListener('visibilitychange',()=>{if(!document.hidden){updateMonth();if(db&&!busy&&!$('#viewer').open&&!$('#composer').open)refresh().catch(fail);}});
 (async()=>{try{db=await connect();db.onversionchange=()=>db.close();await refresh();for(const id of ['add','export','import'])$('#'+id).disabled=false;}catch(e){$('#grid').textContent='저장소를 열지 못했음 · 일반 브라우저에서 다시 열어 주세요';fail(e);}})();
+
+// Prevent touch-driven page zoom while preserving scrolling and photo swipes.
+for (const eventName of ['gesturestart', 'gesturechange']) {
+  document.addEventListener(eventName, event => event.preventDefault(), { passive: false });
+}
