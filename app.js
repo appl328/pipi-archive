@@ -20,7 +20,7 @@ function connect() { return new Promise((resolve,reject) => { const request = in
 function transaction(mode, action) { return new Promise((resolve,reject) => { const tx = db.transaction('records',mode); const request = action(tx.objectStore('records')); tx.oncomplete = () => resolve(request?.result); tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || new Error('저장이 취소됨')); }); }
 async function refresh() { entries = await transaction('readonly',store => store.getAll()); entries.sort((a,b)=> b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id)); for(const url of urls.values()) URL.revokeObjectURL(url); urls.clear(); render(); }
 function imageURL(e) { if(!urls.has(e.id)) urls.set(e.id,URL.createObjectURL(e.image)); return urls.get(e.id); }
-function render() { const total = Math.max(1,Math.ceil(entries.length/4)); page = Math.max(0,Math.min(page,total-1)); $('#grid').replaceChildren(); if(!entries.length) { const empty = document.createElement('div'); empty.className='empty'; empty.innerHTML='<span>아직 비어 있는 첫 페이지</span><p>피피의 사진과 한마디를 넣어 주세요</p>'; $('#grid').append(empty); }
+function render() { for(const url of urls.values()) URL.revokeObjectURL(url); urls.clear(); const total = Math.max(1,Math.ceil(entries.length/4)); page = Math.max(0,Math.min(page,total-1)); $('#grid').replaceChildren(); if(!entries.length) { const empty = document.createElement('div'); empty.className='empty'; empty.innerHTML='<span>아직 비어 있는 첫 페이지</span><p>피피의 사진과 한마디를 넣어 주세요</p>'; $('#grid').append(empty); }
 entries.slice(page*4,page*4+4).forEach((e,i) => { const card = document.createElement('button'); card.className='card'; card.innerHTML='<div class="photo"><img alt="피피 사진"></div><span class="caption"></span><time></time>'; card.querySelector('img').src=imageURL(e); card.querySelector('.caption').textContent=e.text || '사진으로 남긴 하루'; card.querySelector('time').textContent=e.date.replaceAll('-','. '); card.onclick=()=>openEntry(page*4+i); $('#grid').append(card); }); $('#page').textContent=`${page+1} / ${total}`; $('#prev').disabled=page===0; $('#next').disabled=page===total-1; $('#entry-total').textContent=entries.length; }
 function openEntry(index) { selected=index; const e=entries[index]; if(!e)return; $('#large').src=imageURL(e); $('#message').textContent=e.text; $('#date').value=e.date; $('#count').textContent=`${index+1} / ${entries.length}`; $('#back').disabled=index===0; $('#forward').disabled=index===entries.length-1; if(!$('#viewer').open)$('#viewer').showModal(); }
 function move(delta){ if(!busy && selected+delta>=0 && selected+delta<entries.length)openEntry(selected+delta); }
@@ -36,11 +36,91 @@ $('#prev').onclick=()=>{page--;render();};$('#next').onclick=()=>{page++;render(
 document.addEventListener('keydown',e=>{if($('#viewer').open && !['INPUT','TEXTAREA','BUTTON'].includes(e.target.tagName)){if(e.key==='ArrowRight')move(1);if(e.key==='ArrowLeft')move(-1);}});
 let touch; $('#large').addEventListener('touchstart',e=>{touch=[e.changedTouches[0].clientX,e.changedTouches[0].clientY];},{passive:true});$('#large').addEventListener('touchend',e=>{if(!touch)return;const dx=e.changedTouches[0].clientX-touch[0],dy=e.changedTouches[0].clientY-touch[1];if(Math.abs(dx)>45&&Math.abs(dx)>Math.abs(dy))move(dx<0?1:-1);touch=null;},{passive:true});
 function dataURL(blob){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error);reader.readAsDataURL(blob);});}
-$('#export').onclick=()=>run(async()=>{ const records=await transaction('readonly',s=>s.getAll()); const backup={format:'pipi-archive',version:1,exportedAt:new Date().toISOString(),records:[]}; for(const e of records)backup.records.push({...e,image:await dataURL(e.image)}); const url=URL.createObjectURL(new Blob([JSON.stringify(backup)],{type:'application/json'})); const a=document.createElement('a'); a.href=url;a.download=`PIPI-ARCHIVE-backup-${today()}-${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);notify(`${records.length}개 기록의 백업 파일 다운로드를 시작함`); });
-$('#import').onclick=()=>$('#backup-file').click();
-$('#backup-file').onchange=()=>run(async()=>{const file=$('#backup-file').files[0];$('#backup-file').value='';if(!file)return;const data=JSON.parse(await file.text());if(data.format!=='pipi-archive'||data.version!==1||!Array.isArray(data.records))throw new Error('PIPI ARCHIVE 백업 파일이 아님');const ids=new Set();const parsed=[];for(const e of data.records){if(typeof e.id!=='string'||!e.id||e.id.length>100||ids.has(e.id)||typeof e.text!=='string'||e.text.length>10000||!validDate(e.date)||typeof e.createdAt!=='string'||isNaN(Date.parse(e.createdAt))||typeof e.image!=='string'||!/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]*={0,2}$/.test(e.image))throw new Error('백업 기록 형식이 올바르지 않음');ids.add(e.id);const [meta,body]=e.image.split(',');if(body.length>MAX_IMAGE*1.4)throw new Error('백업에 20MB를 넘는 사진이 포함됨');const bytes=Uint8Array.from(atob(body),c=>c.charCodeAt(0));const image=new Blob([bytes],{type:meta.slice(5,meta.indexOf(';'))});await checkImage(image);parsed.push({id:e.id,text:e.text,date:e.date,createdAt:e.createdAt,image});}pendingBackup=parsed;const existing=new Set(entries.map(e=>e.id));$('#restore-summary').textContent=`백업 ${parsed.length}개 중 새 기록 ${parsed.filter(e=>!existing.has(e.id)).length}개를 가져옴`;$('#restore').showModal();});
+$('#export').onclick=()=>run(async()=>{
+  backupProgress('백업 만드는 중');
+  const keys=await transaction('readonly',s=>s.getAllKeys());
+  const parts=[new Blob(['{"format":"pipi-archive","version":1,"exportedAt":'+JSON.stringify(new Date().toISOString())+',"records":['])];
+  for(let i=0;i<keys.length;i++){
+    const e=await transaction('readonly',s=>s.get(keys[i]));
+    if(!e)throw new Error('백업 중 기록이 변경됨 다시 시도해 주세요');
+    parts.push(new Blob([(i?',':'')+JSON.stringify({...e,image:await dataURL(e.image)})]));
+    backupProgress(`백업 만드는 중 · ${i+1} / ${keys.length}`);
+    await new Promise(r=>setTimeout(r,0));
+  }
+  parts.push(new Blob([']}']));
+  const url=URL.createObjectURL(new Blob(parts,{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=`PIPI-ARCHIVE-backup-${today()}-${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);notify(`${keys.length}개 기록의 백업 다운로드를 시작함`);
+});
+// Read legacy JSON backups incrementally. Never materialize the entire file.
+async function* backupRecords(file, chunkSize = 256 * 1024) {
+  const decoder = new TextDecoder('utf-8', {fatal:true});
+  let prefix='', tail='', started=false, ended=false, phase='first', depth=0, quoted=false, escaped=false, parts=[];
+  for(let offset=0;offset<file.size;offset+=chunkSize){
+    let chunk=decoder.decode(await file.slice(offset,offset+chunkSize).arrayBuffer(),{stream:offset+chunkSize<file.size});
+    if(!started){prefix+=chunk;const match=/"records"\s*:\s*\[/.exec(prefix);if(!match){if(prefix.length>65536)throw new Error('백업 머리글이 올바르지 않음');continue;}chunk=prefix.slice(match.index+match[0].length);prefix=prefix.slice(0,match.index+match[0].length-1);started=true;}
+    let segment=0;
+    for(let i=0;i<chunk.length;i++){
+      const c=chunk[i];
+      if(ended){tail+=chunk.slice(i);if(tail.length>65536)throw new Error('백업 끝부분이 올바르지 않음');break;}
+      if(phase!=='record'){
+        if(/\s/.test(c))continue;
+        if(phase==='comma'){if(c===','){phase='next';continue;}if(c===']'){ended=true;continue;}throw new Error('백업 구분자가 올바르지 않음');}
+        if(c===']'&&phase==='first'){ended=true;continue;}
+        if(c!=='{')throw new Error('백업 기록이 올바르지 않음');
+        phase='record';depth=1;quoted=false;escaped=false;segment=i;continue;
+      }
+      if(quoted){if(escaped)escaped=false;else if(c==='\\')escaped=true;else if(c==='"')quoted=false;}
+      else if(c==='"')quoted=true;
+      else if(c==='{'||c==='[')depth++;
+      else if(c==='}'||c===']'){
+        depth--;
+        if(depth===0){parts.push(chunk.slice(segment,i+1));const record=JSON.parse(parts.join(''));parts=[];phase='comma';yield record;}
+      }
+    }
+    if(phase==='record')parts.push(chunk.slice(segment));
+  }
+  if(!started||!ended||phase==='record')throw new Error('백업 파일이 중간에 끊겨 있음');
+  const envelope=JSON.parse(prefix+'[]'+tail);
+  if(envelope.format!=='pipi-archive'||envelope.version!==1)throw new Error('PIPI ARCHIVE 백업 파일이 아님');
+}
+function validateBackupRecord(e){
+  if(typeof e.id!=='string'||!e.id||e.id.length>100||typeof e.text!=='string'||e.text.length>10000||!validDate(e.date)||typeof e.createdAt!=='string'||isNaN(Date.parse(e.createdAt))||typeof e.image!=='string')throw new Error('백업 기록 형식이 올바르지 않음');
+  const comma=e.image.indexOf(',');
+  if(!/^data:image\/(png|jpeg|webp|gif);base64$/.test(e.image.slice(0,comma)))throw new Error('백업 사진 형식이 올바르지 않음');
+  return comma;
+}
+function backupImage(e){
+  const comma=validateBackupRecord(e),parts=[];
+  // Decode small base64 blocks, avoiding a second full-image binary string.
+  for(let i=comma+1;i<e.image.length;i+=65536){const binary=atob(e.image.slice(i,i+65536));const bytes=new Uint8Array(binary.length);for(let j=0;j<binary.length;j++)bytes[j]=binary.charCodeAt(j);parts.push(bytes);}
+  return new Blob(parts,{type:e.image.slice(5,e.image.indexOf(';'))});
+}
+function backupProgress(text){notify(text);clearTimeout(noticeTimer);}
+$('#import').onclick=()=>{if(!busy)$('#backup-file').click();};
+$('#backup-file').onchange=()=>run(async()=>{
+  const file=$('#backup-file').files[0];$('#backup-file').value='';if(!file)return;
+  pendingBackup=null;backupProgress('백업 확인 중 · 큰 파일은 시간이 걸림');
+  let count=0;const ids=new Set();
+  try{
+    for await(const e of backupRecords(file)){validateBackupRecord(e);if(ids.has(e.id))throw new Error('백업에 중복 ID가 있음');ids.add(e.id);count++;if(count%10===0){backupProgress(`백업 확인 중 · ${count}개`);await new Promise(r=>setTimeout(r,0));}}
+    pendingBackup=file;hideNotice();$('#restore-summary').textContent=`${count}개 기록을 순서대로 가져옴`;$('#restore').showModal();
+  }catch(e){hideNotice();throw e;}
+});
 $('#restore-cancel').onclick=()=>{pendingBackup=null;$('#restore').close();};
-$('#restore-confirm').onclick=()=>run(async()=>{if(!pendingBackup)return;const records=pendingBackup;await new Promise((resolve,reject)=>{const tx=db.transaction('records','readwrite'),store=tx.objectStore('records');for(const e of records){const req=store.get(e.id);req.onsuccess=()=>{if(!req.result)store.add(e);};}tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('가져오기가 취소됨'));});pendingBackup=null;$('#restore').close();page=0;await refresh();notify('백업 가져오기 완료');});
+$('#restore-confirm').onclick=()=>run(async()=>{
+  if(!pendingBackup)return;const file=pendingBackup;pendingBackup=null;$('#restore').close();let added=0,skipped=0;
+  try{
+    for await(const e of backupRecords(file)){
+      const exists=await transaction('readonly',s=>s.getKey(e.id));
+      if(exists!==undefined){skipped++;continue;}
+      const image=backupImage(e);
+      // Do not decode all full-resolution images into GPU/image memory during restore.
+      await transaction('readwrite',s=>s.put({id:e.id,text:e.text,date:e.date,createdAt:e.createdAt,image}));
+      added++;backupProgress(`복원 중 · ${added}개 저장 / ${skipped}개 중복 건너뜀`);await new Promise(r=>setTimeout(r,0));
+    }
+    page=0;await refresh();notify(`백업 복원 완료 · ${added}개 저장 / ${skipped}개 중복`);
+  }catch(e){await refresh();fail(e);$('#status span').textContent+=` · ${added}개는 저장됨 같은 파일로 다시 시도하면 이어서 복원함`;clearTimeout(noticeTimer);}
+});
+
 updateMonth();setInterval(updateMonth,60000);document.addEventListener('visibilitychange',()=>{if(!document.hidden){updateMonth();if(db&&!busy&&!$('#viewer').open&&!$('#composer').open)refresh().catch(fail);}});
 (async()=>{try{db=await connect();db.onversionchange=()=>db.close();await refresh();for(const id of ['add','export','import'])$('#'+id).disabled=false;}catch(e){$('#grid').textContent='저장소를 열지 못했음 · 일반 브라우저에서 다시 열어 주세요';fail(e);}})();
 
