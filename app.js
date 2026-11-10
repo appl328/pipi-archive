@@ -35,10 +35,57 @@ $('#undo').onclick=()=>run(async()=>{if(!deleted)return;await transaction('readw
 $('#prev').onclick=()=>{page--;render();};$('#next').onclick=()=>{page++;render();};$('#back').onclick=()=>move(-1);$('#forward').onclick=()=>move(1);
 document.addEventListener('keydown',e=>{if($('#viewer').open && !['INPUT','TEXTAREA','BUTTON'].includes(e.target.tagName)){if(e.key==='ArrowRight')move(1);if(e.key==='ArrowLeft')move(-1);}});
 let touch; $('#large').addEventListener('touchstart',e=>{touch=[e.changedTouches[0].clientX,e.changedTouches[0].clientY];},{passive:true});$('#large').addEventListener('touchend',e=>{if(!touch)return;const dx=e.changedTouches[0].clientX-touch[0],dy=e.changedTouches[0].clientY-touch[1];if(Math.abs(dx)>45&&Math.abs(dx)>Math.abs(dy))move(dx<0?1:-1);touch=null;},{passive:true});
+// Read legacy v1 JSON incrementally; retain only one encoded photo at a time.
+async function readBackup(file, onRecord) {
+  let buffer='', header='', suffix='', phase='header', scan=0, start=0, depth=0, quoted=false, escaped=false, needRecord=true, count=0;
+  const decoder=new TextDecoder('utf-8',{fatal:true});
+  async function consume() {
+    if(phase==='header') {
+      const match=/"records"\s*:\s*\[/.exec(buffer);
+      if(!match) {if(buffer.length>1024*1024)throw new Error('백업 헤더 형식이 올바르지 않음');return;}
+      header=buffer.slice(0,match.index)+ '"records":[';
+      buffer=buffer.slice(match.index+match[0].length);phase='records';scan=0;
+    }
+    if(phase==='records') {
+      for(;scan<buffer.length;scan++) {
+        const ch=buffer[scan];
+        if(depth===0) {
+          if(/\s/.test(ch))continue;
+          if(ch===']') {if(needRecord&&count)throw new Error('백업 배열 형식 오류');suffix=buffer.slice(scan);buffer='';phase='suffix';return;}
+          if(!needRecord) {if(ch!==',')throw new Error('백업 구분자 오류');needRecord=true;continue;}
+          if(ch!=='{')throw new Error('백업 기록 형식 오류');
+          start=scan;depth=1;quoted=false;escaped=false;continue;
+        }
+        if(quoted) {if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch==='"')quoted=false;}
+        else if(ch==='"')quoted=true;
+        else if(ch==='{'||ch==='[')depth++;
+        else if(ch==='}'||ch===']') {
+          depth--;
+          if(depth===0) {
+            const record=JSON.parse(buffer.slice(start,scan+1));
+            await onRecord(record);count++;needRecord=false;
+            buffer=buffer.slice(scan+1);scan=-1;
+          }
+        }
+      }
+      if(buffer.length>32*1024*1024)throw new Error('백업의 개별 기록이 너무 큼');
+    }
+  }
+  for(let offset=0;offset<file.size;offset+=1024*1024) {
+    const text=decoder.decode(await file.slice(offset,offset+1024*1024).arrayBuffer(),{stream:true});
+    if(phase==='suffix')suffix+=text;else {buffer+=text;await consume();}
+    if(suffix.length>1024*1024)throw new Error('백업 끝부분 형식 오류');
+  }
+  const tail=decoder.decode();if(phase==='suffix')suffix+=tail;else {buffer+=tail;await consume();}
+  if(phase!=='suffix')throw new Error('백업 파일이 잘렸거나 형식이 올바르지 않음');
+  const metadata=JSON.parse(header+suffix);
+  if(metadata.format!=='pipi-archive'||metadata.version!==1)throw new Error('PIPI ARCHIVE 백업 파일이 아님');
+}
+
 function dataURL(blob){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error);reader.readAsDataURL(blob);});}
-$('#export').onclick=()=>run(async()=>{ const records=await transaction('readonly',s=>s.getAll()); const backup={format:'pipi-archive',version:1,exportedAt:new Date().toISOString(),records:[]}; for(const e of records)backup.records.push({...e,image:await dataURL(e.image)}); const url=URL.createObjectURL(new Blob([JSON.stringify(backup)],{type:'application/json'})); const a=document.createElement('a'); a.href=url;a.download=`PIPI-ARCHIVE-backup-${today()}-${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);notify(`${records.length}개 기록의 백업 파일 다운로드를 시작함`); });
+$('#export').onclick=()=>run(async()=>{ const records=await transaction('readonly',s=>s.getAll()); const parts=['{"format":"pipi-archive","version":1,"exportedAt":'+JSON.stringify(new Date().toISOString())+',"records":[']; for(let i=0;i<records.length;i++){if(i)parts.push(',');parts.push(new Blob([JSON.stringify({...records[i],image:await dataURL(records[i].image)})]));}parts.push(']}');const url=URL.createObjectURL(new Blob(parts,{type:'application/json'})); const a=document.createElement('a'); a.href=url;a.download=`PIPI-ARCHIVE-backup-${today()}-${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);notify(`${records.length}개 기록의 백업 파일 다운로드를 시작함`); });
 $('#import').onclick=()=>$('#backup-file').click();
-$('#backup-file').onchange=()=>run(async()=>{const file=$('#backup-file').files[0];$('#backup-file').value='';if(!file)return;if(file.size>300*1024*1024)throw new Error('백업 파일은 300MB 이하여야 함');const data=JSON.parse(await file.text());if(data.format!=='pipi-archive'||data.version!==1||!Array.isArray(data.records))throw new Error('PIPI ARCHIVE 백업 파일이 아님');const ids=new Set();const parsed=[];for(const e of data.records){if(typeof e.id!=='string'||!e.id||e.id.length>100||ids.has(e.id)||typeof e.text!=='string'||e.text.length>10000||!validDate(e.date)||typeof e.createdAt!=='string'||isNaN(Date.parse(e.createdAt))||typeof e.image!=='string'||!/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]*={0,2}$/.test(e.image))throw new Error('백업 기록 형식이 올바르지 않음');ids.add(e.id);const [meta,body]=e.image.split(',');if(body.length>MAX_IMAGE*1.4)throw new Error('백업에 20MB를 넘는 사진이 포함됨');const bytes=Uint8Array.from(atob(body),c=>c.charCodeAt(0));const image=new Blob([bytes],{type:meta.slice(5,meta.indexOf(';'))});await checkImage(image);parsed.push({id:e.id,text:e.text,date:e.date,createdAt:e.createdAt,image});}pendingBackup=parsed;const existing=new Set(entries.map(e=>e.id));$('#restore-summary').textContent=`백업 ${parsed.length}개 중 새 기록 ${parsed.filter(e=>!existing.has(e.id)).length}개를 가져옴`;$('#restore').showModal();});
+$('#backup-file').onchange=()=>run(async()=>{const file=$('#backup-file').files[0];$('#backup-file').value='';if(!file)return;pendingBackup=null;notify('백업 파일을 읽는 중');const ids=new Set();const parsed=[];await readBackup(file,async e=>{if(typeof e.id!=='string'||!e.id||e.id.length>100||ids.has(e.id)||typeof e.text!=='string'||e.text.length>10000||!validDate(e.date)||typeof e.createdAt!=='string'||isNaN(Date.parse(e.createdAt))||typeof e.image!=='string'||!/^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]*={0,2}$/.test(e.image))throw new Error('백업 기록 형식이 올바르지 않음');ids.add(e.id);const [meta,body]=e.image.split(',');if(body.length>MAX_IMAGE*1.4)throw new Error('백업에 20MB를 넘는 사진이 포함됨');const bytes=Uint8Array.from(atob(body),c=>c.charCodeAt(0));const image=new Blob([bytes],{type:meta.slice(5,meta.indexOf(';'))});await checkImage(image);parsed.push({id:e.id,text:e.text,date:e.date,createdAt:e.createdAt,image});});pendingBackup=parsed;const existing=new Set(entries.map(e=>e.id));$('#restore-summary').textContent=`백업 ${parsed.length}개 중 새 기록 ${parsed.filter(e=>!existing.has(e.id)).length}개를 가져옴`;$('#restore').showModal();});
 $('#restore-cancel').onclick=()=>{pendingBackup=null;$('#restore').close();};
 $('#restore-confirm').onclick=()=>run(async()=>{if(!pendingBackup)return;const records=pendingBackup;await new Promise((resolve,reject)=>{const tx=db.transaction('records','readwrite'),store=tx.objectStore('records');for(const e of records){const req=store.get(e.id);req.onsuccess=()=>{if(!req.result)store.add(e);};}tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||new Error('가져오기가 취소됨'));});pendingBackup=null;$('#restore').close();page=0;await refresh();notify('백업 가져오기 완료');});
 updateMonth();setInterval(updateMonth,60000);document.addEventListener('visibilitychange',()=>{if(!document.hidden){updateMonth();if(db&&!busy&&!$('#viewer').open&&!$('#composer').open)refresh().catch(fail);}});
